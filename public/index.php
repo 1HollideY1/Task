@@ -1,74 +1,76 @@
 <?php
 require '../vendor/autoload.php';
+require_once 'mongoDB.php';
 
 session_start();
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    require_once 'mongoDB.php';
+try {
+    $connection = DatabaseConnection::getConnection();
 
-    if (isBlocked()) {
-        $remainingTime = $_SESSION['blocked_until'] - time();
-        $error = "Слишком много попыток входа. Попробуйте снова через {$remainingTime} секунд.";
-    } else {
+    $loginAttemptsCollection = $connection->auth_db->login_attempts;
+    $usersCollection = $connection->auth_db->users;
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $login = $_POST['login'];
         $password = $_POST['password'];
-        
-        try {
-            $connection = DatabaseConnection::getConnection();
-            $collection = $connection->auth_db->users;
 
-            $user = $collection->findOne([
+        $currentTime = time();
+        $clientIP = $_SERVER['REMOTE_ADDR'];
+
+        $blockAttempt = $loginAttemptsCollection->findOne([
+            'ip' => $clientIP,
+            'blocked_until' => ['$gt' => $currentTime]
+        ]);
+
+        if ($blockAttempt) {
+            $remainingTime = $blockAttempt['blocked_until'] - $currentTime;
+            $error = "Слишком много попыток входа. Попробуйте снова через {$remainingTime} секунд.";
+        }
+        else {
+            $user = $usersCollection->findOne([
                 'login' => $login,
-                'password' => $password
+                'password' => $password 
             ]);
 
             if ($user) {
-                $_SESSION['login_attempts'] = [];
+                $loginAttemptsCollection->deleteMany([
+                    'ip' => $clientIP,
+                    'timestamp' => ['$lt' => $currentTime - 30]
+                ]);
+
                 $_SESSION['user_id'] = (string)$user->_id;
+
                 header('Location: home.php');
                 exit;
-            } else {
-                if (registerFailedAttempt()) {
-                    $error = "Слишком много попыток входа. Вы заблокированы на 20 секунд.";
-                } else {
-                    $remainingAttempts = 3 - count($_SESSION['login_attempts']);
+            }
+            else {
+                $recentAttempts = $loginAttemptsCollection->count([
+                    'ip' => $clientIP,
+                    'timestamp' => ['$gt' => $currentTime - 30]
+                ]);
 
+                if ($recentAttempts >= 2) {
+                    $loginAttemptsCollection->insertOne([
+                        'ip' => $clientIP,
+                        'timestamp' => $currentTime,
+                        'blocked_until' => $currentTime + 40
+                    ]);
+
+                    $error = "Слишком много попыток входа. Вы заблокированы на 40 секунд.";
+                } else {
+                    $loginAttemptsCollection->insertOne([
+                        'ip' => $clientIP,
+                        'timestamp' => $currentTime,
+                    ]);
+
+                    $remainingAttempts = 3 - ($recentAttempts + 1);
                     $error = "Неверный пароль или логин. Осталось {$remainingAttempts} попыток.";
                 }
             }
-        } catch (Exception $e) {
-            $error = "Упс, ошибочка: " . $e->getMessage();
         }
     }
-}
-
-function isBlocked() {
-    if (isset($_SESSION['blocked_until']) && time() < $_SESSION['blocked_until']) {
-        return true;
-    }
-    return false;
-}
-
-function registerFailedAttempt() {
-    $currentTime = time();
-    
-    if (!isset($_SESSION['login_attempts'])) {
-        $_SESSION['login_attempts'] = [];
-    }
-    
-    $_SESSION['login_attempts'] = array_filter($_SESSION['login_attempts'], function($timestamp) use ($currentTime) {
-        return $currentTime - $timestamp <= 30;
-    });
-    
-    $_SESSION['login_attempts'][] = $currentTime;
-    
-    if (count($_SESSION['login_attempts']) >= 3) {
-        $_SESSION['blocked_until'] = $currentTime + 20;
-        $_SESSION['login_attempts'] = [];
-        return true;
-    }
-    
-    return false;
+} catch (Exception $e) {
+    $error = "Упс, ошибочка: " . $e->getMessage();
 }
 ?>
 
